@@ -189,56 +189,152 @@ def download_job(job_id: str):
 
 
 async def translate_page(provider: str, blocks: list[dict[str, Any]]) -> list[str]:
+    if not blocks:
+        return []
+
     config = PROVIDERS[provider]
     api_key = os.getenv(config["key_env"], "")
     model = os.getenv(config["model_env"], config["default_model"])
-    payload_text = json.dumps([b["text"] for b in blocks], ensure_ascii=False)
+
+    if not api_key:
+        raise RuntimeError(f"{config['key_env']} is not configured.")
+
     system_prompt = (
-        "You are a professional English-to-Myanmar (Burmese) translator. Translate every input item into natural, "
-        "accurate Myanmar Unicode. Preserve names, numbers, URLs, code, citations, and technical terms where appropriate. "
-        "Do not summarize, omit, or combine items. Return ONLY a JSON array of strings with exactly the same number and order of items."
+        "You are a professional English-to-Myanmar translator. "
+        "Translate every input item into natural Myanmar Unicode. "
+        "Preserve names, numbers, URLs, code and citations. "
+        "Never omit, merge, split, or reorder items. "
+        "Return only valid JSON containing one translated string per input."
     )
-    user_prompt = "Translate these text blocks into Myanmar. Keep one translation per input item:\n" + payload_text
-    async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=20.0)) as client:
+
+    def parse_answer(answer: str, expected: int) -> list[str]:
+        answer = answer.strip()
+        if answer.startswith("```"):
+            lines = answer.splitlines()
+            lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines.pop()
+            answer = "\\n".join(lines).strip()
+
+        parsed = json.loads(answer)
+
+        if isinstance(parsed, dict):
+            parsed = parsed.get("translations")
+
+        if expected == 1 and isinstance(parsed, str):
+            parsed = [parsed]
+
+        if (
+            not isinstance(parsed, list)
+            or len(parsed) != expected
+            or not all(isinstance(item, str) for item in parsed)
+        ):
+            raise ValueError(
+                f"Expected {expected} translated strings; response count did not match."
+            )
+
+        return [item.strip() for item in parsed]
+
+    async def request_batch(
+        client: httpx.AsyncClient,
+        texts: list[str],
+    ) -> list[str]:
+        prompt = (
+            f"Translate exactly {len(texts)} items into Myanmar. "
+            "Return a JSON array with exactly one string per input, in order.\n"
+            + json.dumps(texts, ensure_ascii=False)
+        )
+
         last_error = None
+
         for attempt in range(3):
             try:
                 if provider == "gemini":
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+                    url = (
+                        "https://generativelanguage.googleapis.com/"
+                        f"v1beta/models/{model}:generateContent"
+                    )
                     response = await client.post(
                         url,
                         params={"key": api_key},
-                        json={"systemInstruction": {"parts": [{"text": system_prompt}]},
-                              "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-                              "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}},
+                        json={
+                            "systemInstruction": {
+                                "parts": [{"text": system_prompt}]
+                            },
+                            "contents": [
+                                {"role": "user", "parts": [{"text": prompt}]}
+                            ],
+                            "generationConfig": {
+                                "temperature": 0.1,
+                                "responseMimeType": "application/json",
+                            },
+                        },
                     )
                     response.raise_for_status()
                     data = response.json()
-                    answer = data["candidates"][0]["content"]["parts"][0]["text"]
+                    candidates = data.get("candidates", [])
+                    if not candidates:
+                        raise ValueError("Gemini returned no candidates.")
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    answer = "".join(p.get("text", "") for p in parts)
                 else:
-                    groq_system = system_prompt + " Return a JSON object with one key named translations; its value must be the array of translated strings."
                     response = await client.post(
                         "https://api.groq.com/openai/v1/chat/completions",
                         headers={"Authorization": f"Bearer {api_key}"},
-                        json={"model": model,
-                              "messages": [{"role": "system", "content": groq_system},
-                                           {"role": "user", "content": user_prompt}],
-                              "temperature": 0.2,
-                              "response_format": {"type": "json_object"}},
+                        json={
+                            "model": model,
+                            "messages": [
+                                {
+                                    "role": "system",
+                                    "content": system_prompt
+                                    + " Return a JSON object with key translations containing the array.",
+                                },
+                                {"role": "user", "content": prompt},
+                            ],
+                            "temperature": 0.1,
+                            "response_format": {"type": "json_object"},
+                        },
                     )
                     response.raise_for_status()
                     answer = response.json()["choices"][0]["message"]["content"]
-                parsed = json.loads(answer)
-                if isinstance(parsed, dict):
-                    parsed = parsed.get("translations")
-                if not isinstance(parsed, list) or len(parsed) != len(blocks) or not all(isinstance(x, str) for x in parsed):
-                    raise ValueError("AI response did not contain the expected number of translated strings.")
-                return parsed
+
+                return parse_answer(answer, len(texts))
+
             except Exception as exc:
                 last_error = exc
                 if attempt < 2:
                     await asyncio.sleep(1.5 * (attempt + 1))
-        raise RuntimeError(f"{provider.title()} translation failed after retries: {last_error}")
+
+        raise RuntimeError(str(last_error))
+
+    translated: list[str] = []
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(90.0, connect=20.0)
+    ) as client:
+        batch_size = 5
+
+        for offset in range(0, len(blocks), batch_size):
+            texts = [
+                block["text"]
+                for block in blocks[offset:offset + batch_size]
+            ]
+
+            try:
+                translated.extend(await request_batch(client, texts))
+            except Exception:
+                for index, text in enumerate(texts, start=offset + 1):
+                    try:
+                        translated.extend(await request_batch(client, [text]))
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Translation failed at text block {index}: {exc}"
+                        ) from exc
+
+    if len(translated) != len(blocks):
+        raise RuntimeError("Internal translation count mismatch.")
+
+    return translated
 
 
 def page_text_blocks(page: fitz.Page) -> list[dict[str, Any]]:

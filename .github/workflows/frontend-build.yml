@@ -1,0 +1,40 @@
+name: G.I PDF Translator - Frontend Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm install
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Upload website artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gi-pdf-translator-frontend
+          path: frontend/dist/
+          if-no-files-found: error
+          retention-days: 7

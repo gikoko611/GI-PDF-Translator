@@ -23,7 +23,8 @@ load_dotenv(BASE_DIR / ".env")
 DATA_DIR = BASE_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 OUTPUT_DIR = DATA_DIR / "outputs"
-for folder in (UPLOAD_DIR, OUTPUT_DIR):
+CHECKPOINT_DIR = DATA_DIR / "checkpoints"
+for folder in (UPLOAD_DIR, OUTPUT_DIR, CHECKPOINT_DIR):
     folder.mkdir(parents=True, exist_ok=True)
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "15"))
@@ -68,6 +69,85 @@ def public_job(job: dict[str, Any]) -> dict[str, Any]:
         "id", "filename", "provider", "status", "progress", "total_pages",
         "completed_pages", "message", "error", "created_at", "updated_at"
     )}
+
+
+def save_job_checkpoint(job: dict[str, Any]) -> None:
+    """Atomically save job metadata without duplicating page translations."""
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    path = CHECKPOINT_DIR / f"{job['id']}.json"
+    temp = path.with_suffix(".tmp")
+    metadata = {k: v for k, v in job.items() if k != "page_cache"}
+    temp.write_text(
+        json.dumps(metadata, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    temp.replace(path)
+
+
+def save_page_checkpoint(job: dict[str, Any], index: int) -> None:
+    """Atomically persist one translated page (zero-based page index)."""
+    folder = CHECKPOINT_DIR / job["id"] / "pages"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{index}.json"
+    temp = path.with_suffix(".tmp")
+    temp.write_text(
+        json.dumps(job["page_cache"][index], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    temp.replace(path)
+
+
+def restore_checkpoint_jobs() -> None:
+    """Restore jobs after a process restart when their source PDFs still exist."""
+    for metadata_path in CHECKPOINT_DIR.glob("*.json"):
+        try:
+            job = json.loads(metadata_path.read_text(encoding="utf-8"))
+            job_id = job.get("id")
+            if not job_id or not Path(job.get("input_path", "")).is_file():
+                continue
+
+            page_folder = CHECKPOINT_DIR / job_id / "pages"
+            cache: dict[int, Any] = {}
+            if page_folder.is_dir():
+                for page_file in page_folder.glob("*.json"):
+                    try:
+                        index = int(page_file.stem)
+                        if 0 <= index < int(job["total_pages"]):
+                            cache[index] = json.loads(
+                                page_file.read_text(encoding="utf-8")
+                            )
+                    except (ValueError, OSError, json.JSONDecodeError):
+                        continue
+
+            job["page_cache"] = cache
+            job["completed_pages"] = len(cache)
+            total = max(1, int(job["total_pages"]))
+            job["progress"] = round(len(cache) / total * 100)
+
+            if job.get("status") in ("queued", "processing"):
+                job.update(
+                    status="failed",
+                    error="Backend restarted before the job finished.",
+                    message="Checkpoint restored. Retry to resume unfinished pages.",
+                    updated_at=now(),
+                )
+
+            if job.get("status") == "completed":
+                if not Path(job.get("output_path", "")).is_file():
+                    job.update(
+                        status="failed",
+                        error="Completed output is missing.",
+                        message="Checkpoint restored. Retry to rebuild the PDF.",
+                        updated_at=now(),
+                    )
+
+            JOBS[job_id] = job
+            save_job_checkpoint(job)
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            continue
+
+
+restore_checkpoint_jobs()
 
 
 @app.get("/api/health")
@@ -148,6 +228,7 @@ async def create_job(
         "page_cache": {},
     }
     JOBS[job_id] = job
+    save_job_checkpoint(job)
     TASKS[job_id] = asyncio.create_task(process_job(job_id))
     return public_job(job)
 
@@ -173,6 +254,7 @@ def retry_job(job_id: str):
     if not os.getenv(config["key_env"]):
         raise HTTPException(400, f"{job['provider'].title()} API key is not configured on the backend.")
     job.update(status="queued", error=None, message="Retrying unfinished pages…", updated_at=now())
+    save_job_checkpoint(job)
     TASKS[job_id] = asyncio.create_task(process_job(job_id))
     return public_job(job)
 
@@ -405,50 +487,103 @@ def page_text_blocks(page: fitz.Page) -> list[dict[str, Any]]:
 
 async def process_job(job_id: str):
     job = JOBS[job_id]
-    job.update(status="processing", error=None, message="Extracting text…", updated_at=now())
+    job.update(
+        status="processing",
+        error=None,
+        message="Restoring checkpoint and preparing translation…",
+        updated_at=now(),
+    )
+    save_job_checkpoint(job)
+
     source = Path(job["input_path"])
     output = Path(job["output_path"])
     temp_output = OUTPUT_DIR / f"{job_id}-working.pdf"
+
     try:
+        if not source.is_file():
+            raise RuntimeError(
+                "Original PDF is missing. Upload the PDF again; "
+                "the saved checkpoint alone cannot rebuild the document."
+            )
         if not FONT_PATH.exists():
             raise RuntimeError(
-                "Myanmar font is missing. Add NotoSansMyanmar-Regular.ttf to backend/fonts/ "
-                "or set MYANMAR_FONT_PATH to a valid Unicode Myanmar TTF font."
+                "Myanmar font is missing. Add NotoSansMyanmar-Regular.ttf "
+                "to backend/fonts/ or configure MYANMAR_FONT_PATH."
             )
+
+        # Load any saved page translations before making API requests.
+        page_folder = CHECKPOINT_DIR / job_id / "pages"
+        if page_folder.is_dir():
+            for page_file in page_folder.glob("*.json"):
+                try:
+                    index = int(page_file.stem)
+                    if 0 <= index < int(job["total_pages"]):
+                        if index not in job["page_cache"]:
+                            job["page_cache"][index] = json.loads(
+                                page_file.read_text(encoding="utf-8")
+                            )
+                except (ValueError, OSError, json.JSONDecodeError):
+                    continue
+
         with fitz.open(source) as doc:
             total = len(doc)
+            job["total_pages"] = total
+
             for index, page in enumerate(doc):
                 if index in job["page_cache"]:
                     continue
+
                 blocks = page_text_blocks(page)
                 if not blocks:
                     job["page_cache"][index] = []
+                    save_page_checkpoint(job, index)
                     job["completed_pages"] = len(job["page_cache"])
-                    job["progress"] = round(job["completed_pages"] / total * 100)
-                    job["message"] = f"Page {index + 1}/{total}: no selectable text; keeping page unchanged."
+                    job["progress"] = round(
+                        job["completed_pages"] / max(1, total) * 100
+                    )
+                    job["message"] = (
+                        f"Page {index + 1}/{total}: no selectable text; "
+                        "keeping page unchanged."
+                    )
                     job["updated_at"] = now()
+                    save_job_checkpoint(job)
                     continue
+
                 job["message"] = f"Translating page {index + 1} of {total}…"
                 job["updated_at"] = now()
+                save_job_checkpoint(job)
+
                 translations = await translate_page(job["provider"], blocks)
+
                 job["page_cache"][index] = [
                     {"bbox": b["bbox"], "translation": t}
                     for b, t in zip(blocks, translations)
                 ]
-                job["completed_pages"] = len(job["page_cache"])
-                job["progress"] = round(job["completed_pages"] / total * 100)
-                job["updated_at"] = now()
 
-        # Reopen the original and replace text blocks, preserving page size and other page content where possible.
+                # Persist the page before moving to the next one.
+                save_page_checkpoint(job, index)
+                job["completed_pages"] = len(job["page_cache"])
+                job["progress"] = round(
+                    job["completed_pages"] / max(1, total) * 100
+                )
+                job["updated_at"] = now()
+                save_job_checkpoint(job)
+
+        # Rebuild the final PDF from the original plus all saved translations.
         with fitz.open(source) as doc:
             for index, page in enumerate(doc):
                 translated_blocks = job["page_cache"].get(index, [])
                 if not translated_blocks:
                     continue
-                # White redactions cover the original text region; images and vector graphics are retained.
+
                 for item in translated_blocks:
-                    page.add_redact_annot(fitz.Rect(item["bbox"]), fill=(1, 1, 1), cross_out=False)
+                    page.add_redact_annot(
+                        fitz.Rect(item["bbox"]),
+                        fill=(1, 1, 1),
+                        cross_out=False,
+                    )
                 page.apply_redactions(images=0, graphics=0, text=0)
+
                 for item in translated_blocks:
                     rect = fitz.Rect(item["bbox"])
                     rect.x0 += 1.5
@@ -456,29 +591,68 @@ async def process_job(job_id: str):
                     rect.y0 += 0.5
                     rect.y1 -= 0.5
                     text = item["translation"].strip()
-                    # Shrink text slightly if necessary to fit the original block rectangle.
                     fontsize = 10.5
                     result = page.insert_textbox(
-                        rect, text, fontname="myanmar", fontfile=str(FONT_PATH),
-                        fontsize=fontsize, color=(0.08, 0.08, 0.08), align=0, lineheight=1.15,
+                        rect,
+                        text,
+                        fontname="myanmar",
+                        fontfile=str(FONT_PATH),
+                        fontsize=fontsize,
+                        color=(0.08, 0.08, 0.08),
+                        align=0,
+                        lineheight=1.15,
                     )
                     while result < 0 and fontsize > 5.5:
-                        # Remove the previous failed insertion is not needed: insert_textbox writes nothing when it fails.
                         fontsize -= 0.5
                         result = page.insert_textbox(
-                            rect, text, fontname="myanmar", fontfile=str(FONT_PATH),
-                            fontsize=fontsize, color=(0.08, 0.08, 0.08), align=0, lineheight=1.1,
+                            rect,
+                            text,
+                            fontname="myanmar",
+                            fontfile=str(FONT_PATH),
+                            fontsize=fontsize,
+                            color=(0.08, 0.08, 0.08),
+                            align=0,
+                            lineheight=1.1,
                         )
                     if result < 0:
-                        # Prevent silent loss: write in a larger area below the original block as a fallback.
-                        fallback = fitz.Rect(rect.x0, rect.y0, min(page.rect.x1 - 8, rect.x1 + 12), min(page.rect.y1 - 8, rect.y1 + 28))
-                        page.insert_textbox(fallback, text, fontname="myanmar", fontfile=str(FONT_PATH), fontsize=5.5, color=(0.08, 0.08, 0.08))
+                        fallback = fitz.Rect(
+                            rect.x0,
+                            rect.y0,
+                            min(page.rect.x1 - 8, rect.x1 + 12),
+                            min(page.rect.y1 - 8, rect.y1 + 28),
+                        )
+                        page.insert_textbox(
+                            fallback,
+                            text,
+                            fontname="myanmar",
+                            fontfile=str(FONT_PATH),
+                            fontsize=5.5,
+                            color=(0.08, 0.08, 0.08),
+                        )
+
             doc.save(temp_output, garbage=4, deflate=True)
+
         shutil.move(str(temp_output), str(output))
-        job.update(status="completed", progress=100, completed_pages=job["total_pages"], message="Translation complete. Your Myanmar PDF is ready.", error=None, updated_at=now())
+        job.update(
+            status="completed",
+            progress=100,
+            completed_pages=job["total_pages"],
+            message="Translation complete. Your Myanmar PDF is ready.",
+            error=None,
+            updated_at=now(),
+        )
+        save_job_checkpoint(job)
+
     except Exception as exc:
         temp_output.unlink(missing_ok=True)
-        job.update(status="failed", error=str(exc), message="Translation paused. Retry to continue unfinished pages.", updated_at=now())
+        job.update(
+            status="failed",
+            error=str(exc),
+            message="Translation paused. Retry to continue from saved pages.",
+            updated_at=now(),
+        )
+        save_job_checkpoint(job)
+
     finally:
         task = TASKS.get(job_id)
         if task and task.done():

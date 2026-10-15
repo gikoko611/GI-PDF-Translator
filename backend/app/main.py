@@ -235,6 +235,9 @@ async def translate_page(provider: str, blocks: list[dict[str, Any]]) -> list[st
 
         return [item.strip() for item in parsed]
 
+    class RateLimitError(RuntimeError):
+        pass
+
     async def request_batch(
         client: httpx.AsyncClient,
         texts: list[str],
@@ -300,6 +303,52 @@ async def translate_page(provider: str, blocks: list[dict[str, Any]]) -> list[st
 
                 return parse_answer(answer, len(texts))
 
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 429:
+                    delay = None
+
+                    retry_after = exc.response.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            delay = max(1.0, float(retry_after))
+                        except ValueError:
+                            pass
+
+                    if delay is None:
+                        try:
+                            error_data = exc.response.json().get("error", {})
+                            for detail in error_data.get("details", []):
+                                retry_delay = detail.get("retryDelay", "")
+                                if retry_delay.endswith("s"):
+                                    delay = max(
+                                        1.0, float(retry_delay[:-1])
+                                    )
+                                    break
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+
+                    if delay is None:
+                        delay = min(60.0, 10.0 * (2 ** attempt))
+
+                    if attempt < 2:
+                        print(
+                            f"Gemini rate limit (429). "
+                            f"Waiting {delay:.0f} seconds before retry "
+                            f"{attempt + 2}/3.",
+                            flush=True,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+
+                    raise RateLimitError(
+                        "Gemini API returned 429 after retries. "
+                        "Check project quota and rate limits, then retry later."
+                    ) from exc
+
+                last_error = exc
+                if attempt < 2:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+
             except Exception as exc:
                 last_error = exc
                 if attempt < 2:
@@ -322,6 +371,8 @@ async def translate_page(provider: str, blocks: list[dict[str, Any]]) -> list[st
 
             try:
                 translated.extend(await request_batch(client, texts))
+            except RateLimitError:
+                raise
             except Exception:
                 for index, text in enumerate(texts, start=offset + 1):
                     try:

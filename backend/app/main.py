@@ -247,7 +247,7 @@ def get_job(job_id: str):
 
 
 @app.post("/api/jobs/{job_id}/retry")
-def retry_job(job_id: str):
+async def retry_job(job_id: str):
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "Job not found. Upload the PDF again.")

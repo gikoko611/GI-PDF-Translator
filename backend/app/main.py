@@ -57,6 +57,11 @@ PROVIDERS = {
         "model_env": "GROQ_MODEL",
         "default_model": "openai/gpt-oss-120b",
     },
+    "modelgo": {
+        "key_env": "MODELGO_API_KEY",
+        "model_env": "MODELGO_MODEL",
+        "default_model": "claude-sonnet-5.5:free",
+    },
 }
 
 
@@ -170,7 +175,7 @@ async def create_job(
     provider: str = Form(...),
 ):
     if provider not in PROVIDERS:
-        raise HTTPException(400, "Choose Gemini or Groq.")
+        raise HTTPException(400, "Choose a supported translation provider.")
     config = PROVIDERS[provider]
     if not os.getenv(config["key_env"]):
         raise HTTPException(400, f"{provider.title()} API key is not configured on the backend.")
@@ -296,7 +301,7 @@ async def translate_page(provider: str, blocks: list[dict[str, Any]]) -> list[st
             lines = lines[1:]
             if lines and lines[-1].strip().startswith("```"):
                 lines.pop()
-            answer = "\\n".join(lines).strip()
+            answer = "\n".join(lines).strip()
 
         parsed = json.loads(answer)
 
@@ -362,7 +367,7 @@ async def translate_page(provider: str, blocks: list[dict[str, Any]]) -> list[st
                         raise ValueError("Gemini returned no candidates.")
                     parts = candidates[0].get("content", {}).get("parts", [])
                     answer = "".join(p.get("text", "") for p in parts)
-                else:
+                elif provider == "groq":
                     response = await client.post(
                         "https://api.groq.com/openai/v1/chat/completions",
                         headers={"Authorization": f"Bearer {api_key}"},
@@ -382,6 +387,33 @@ async def translate_page(provider: str, blocks: list[dict[str, Any]]) -> list[st
                     )
                     response.raise_for_status()
                     answer = response.json()["choices"][0]["message"]["content"]
+                else:
+                    response = await client.post(
+                        "https://api.modelgo.ai/v1/messages",
+                        headers={
+                            "x-api-key": api_key,
+                            "anthropic-version": "2023-06-01",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": model,
+                            "max_tokens": 8192,
+                            "system": system_prompt
+                            + " Return only a valid JSON array of translated strings. "
+                            + "Do not include markdown fences or explanations.",
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.1,
+                        },
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+                    answer = "".join(
+                        block.get("text", "")
+                        for block in result.get("content", [])
+                        if block.get("type") == "text"
+                    )
+                    if not answer.strip():
+                        raise ValueError("ModelGo returned an empty response.")
 
                 return parse_answer(answer, len(texts))
 

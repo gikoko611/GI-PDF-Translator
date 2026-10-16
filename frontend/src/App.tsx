@@ -3,10 +3,10 @@ import { Activity, ArrowDownToLine, Check, CheckCircle2, ChevronDown, CircleAler
 
 const API = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/$/, '')
 type Job = { id: string; filename: string; provider: string; status: string; progress: number; total_pages: number; completed_pages: number; message: string; error: string | null }
-type Health = { ok: boolean; providers: { gemini: boolean; groq: boolean }; myanmar_font_ready: boolean; max_upload_mb: number }
+type Health = { ok: boolean; providers: { gemini: boolean; groq: boolean; modelgo: boolean }; myanmar_font_ready: boolean; max_upload_mb: number }
 
 export default function App() {
-  const [provider, setProvider] = useState<'gemini' | 'groq'>('gemini')
+  const [provider, setProvider] = useState<'gemini' | 'groq' | 'modelgo'>('gemini')
   const [file, setFile] = useState<File | null>(null)
   const [job, setJob] = useState<Job | null>(null)
   const [health, setHealth] = useState<Health | null>(null)
@@ -99,9 +99,10 @@ export default function App() {
             <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-gold/10 text-gold">{file ? <Check size={22}/> : <UploadCloud size={24}/>}</div>
             {file ? <><p className="break-all text-sm font-medium text-white">{file.name}</p><p className="mt-1 text-xs text-zinc-500">{fileSize} · Tap to change file</p></> : <><p className="text-sm font-medium">Choose a PDF or drop it here</p><p className="mt-2 text-xs text-zinc-500">Text-based PDF · Max {health?.max_upload_mb || 15} MB</p></>}
           </button>
-          <div className="mt-6"><label className="mb-2 block text-xs font-semibold uppercase tracking-wider text-zinc-400">Translation engine</label><div className="grid grid-cols-2 gap-3">
+          <div className="mt-6"><label className="mb-2 block text-xs font-semibold uppercase tracking-wider text-zinc-400">Translation engine</label><div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
             <button onClick={() => setProvider('gemini')} className={`provider-option ${provider === 'gemini' ? 'provider-active' : ''}`}><Sparkles size={17}/><span>Gemini</span><span className="provider-state">{health ? (health.providers.gemini ? 'Ready' : 'Key missing') : 'Checking'}</span></button>
             <button onClick={() => setProvider('groq')} className={`provider-option ${provider === 'groq' ? 'provider-active' : ''}`}><Activity size={17}/><span>Groq</span><span className="provider-state">{health ? (health.providers.groq ? 'Ready' : 'Key missing') : 'Checking'}</span></button>
+            <button onClick={() => setProvider('modelgo')} className={`provider-option ${provider === 'modelgo' ? 'provider-active' : ''}`}><Sparkles size={17}/><span>Claude Sonnet 5.5</span><span className="provider-state">{health ? (health.providers.modelgo ? 'Ready' : 'Key missing') : 'Checking'}</span></button>
           </div><p className="mt-2 text-[11px] leading-5 text-zinc-500">API keys are configured on the backend, never embedded in this web app.</p></div>
           <button disabled={!file || busy || working} onClick={() => void upload()} className="gold-button mt-6 w-full">{busy ? <LoaderCircle className="animate-spin" size={17}/> : <Languages size={17}/>}<span>{working ? 'Translation in progress' : 'Translate PDF'}</span></button>
           {providerReady === false && <p className="mt-3 flex gap-2 text-xs text-amber-300"><CircleAlert size={15} className="shrink-0"/>This provider's API key is not configured on the backend yet.</p>}
